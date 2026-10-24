@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Queue</title>
+<meta name="theme-color" content="#4f46e5">
+<link rel="manifest" href="manifest.json">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  :root {
+    --bg: #f5f6fb; --card: #ffffff; --text: #1d2033; --muted: #6b7088;
+    --brand: #4f46e5; --brand-ink: #ffffff; --line: #e3e5ef;
+    --good: #15803d; --warn: #b45309; --bad: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11131c; --card: #1b1e2b; --text: #eceef7; --muted: #9aa0b8;
+      --brand: #818cf8; --brand-ink: #11131c; --line: #2c3043;
+      --good: #4ade80; --warn: #fbbf24; --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 520px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  h2 { font-size: 1.05rem; margin: 0 0 12px; }
+  p { margin: 0 0 12px; }
+  .muted { color: var(--muted); font-size: .92rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+    padding: 18px; margin-top: 16px; }
+  label { display: block; font-weight: 600; margin: 0 0 6px; }
+  input { width: 100%; font: inherit; padding: 12px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 12px; padding: 14px 16px;
+    cursor: pointer; background: var(--line); color: var(--text); }
+  button.primary { background: var(--brand); color: var(--brand-ink); }
+  button.big { width: 100%; font-size: 1.15rem; padding: 18px; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 0; }
+  .num { font-size: 5.5rem; font-weight: 800; line-height: 1; letter-spacing: -2px;
+    font-variant-numeric: tabular-nums; text-align: center; margin: 6px 0; }
+  .label { text-align: center; text-transform: uppercase; letter-spacing: 1.5px;
+    font-size: .8rem; color: var(--muted); font-weight: 700; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+  .stat { background: var(--bg); border-radius: 12px; padding: 10px; text-align: center; }
+  .stat b { display: block; font-size: 1.6rem; font-variant-numeric: tabular-nums; }
+  .qr { display: flex; justify-content: center; padding: 12px; background: #fff;
+    border-radius: 12px; margin: 10px auto; width: fit-content; }
+  .link { word-break: break-all; font-size: .85rem; color: var(--muted); }
+  .status { text-align: center; font-weight: 700; font-size: 1.15rem; margin: 10px 0 0; }
+  .status.good { color: var(--good); } .status.warn { color: var(--warn); } .status.bad { color: var(--bad); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted); margin-right: 6px; vertical-align: middle; }
+  .dot.on { background: var(--good); }
+  .turn { animation: pulse 1s infinite alternate; }
+  @keyframes pulse { from { transform: scale(1); } to { transform: scale(1.06); } }
+  .display main { max-width: none; min-height: 100vh; display: flex; flex-direction: column;
+    justify-content: center; text-align: center; }
+  .display .num { font-size: 32vw; }
+  .hidden { display: none !important; }
+  a { color: var(--brand); }
+</style>
+</head>
+<body>
+<main id="app"></main>
+
+<script>
+const NTFY = 'https://ntfy.sh/';
+const app = document.getElementById('app');
+const params = new URLSearchParams(location.search);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+};
+const baseUrl = location.origin + location.pathname;
+
+// ---- Shared queue state, passed through ntfy.sh (free, no sign-up) ----
+async function publish(topic, state) {
+  await fetch(NTFY + topic, { method: 'POST', body: JSON.stringify(state) });
+}
+async function fetchLatest(topic) {
+  try {
+    const r = await fetch(NTFY + topic + '/json?poll=1&since=latest');
+    const lines = (await r.text()).trim().split('\n').filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const m = JSON.parse(lines[i]);
+      if (m.event === 'message') return JSON.parse(m.message);
+    }
+  } catch {}
+  return null;
+}
+function subscribe(topic, onState, onConn) {
+  let es;
+  const open = () => {
+    es = new EventSource(NTFY + topic + '/sse');
+    es.onopen = () => onConn(true);
+    es.onerror = () => onConn(false);
+    es.onmessage = e => {
+      try { const m = JSON.parse(e.data); if (m.event === 'message') onState(JSON.parse(m.message)); } catch {}
+    };
+  };
+  open();
+  const refresh = async () => { const s = await fetchLatest(topic); if (s) onState(s); };
+  // Phones pause pages in the background, so re-check when it comes back and every 20s.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { refresh(); if (es.readyState === 2) open(); }
+  });
+  setInterval(refresh, 20000);
+  refresh();
+}
+
+// ---- Alerts: notification + vibration + beep ----
+let swReg = null;
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  navigator.serviceWorker.register('sw.js').then(r => swReg = r).catch(() => {});
+}
+async function notify(title, body) {
+  if (navigator.vibrate) navigator.vibrate([400, 200, 400, 200, 400]);
+  beep();
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const opts = { body, tag: 'token-queue', renotify: true, requireInteraction: true, vibrate: [400, 200, 400] };
+  try {
+    const reg = swReg || (navigator.serviceWorker && await navigator.serviceWorker.ready);
+    if (reg) return reg.showNotification(title, opts);
+  } catch {}
+  try { new Notification(title, opts); } catch {}
+}
+let audioCtx;
+function beep() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    [0, 0.35, 0.7].forEach(t => {
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = 880; o.connect(g); g.connect(audioCtx.destination);
+      g.gain.setValueAtTime(0.3, audioCtx.currentTime + t);
+      g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + t + 0.3);
+      o.start(audioCtx.currentTime + t); o.stop(audioCtx.currentTime + t + 0.3);
+    });
+  } catch {}
+}
+let wakeLock = null;
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => { if (wakeLock && !document.hidden) keepAwake(); });
+
+function qr(el, text, size = 200) {
+  el.innerHTML = '';
+  if (window.QRCode) new QRCode(el, { text, width: size, height: size, correctLevel: QRCode.CorrectLevel.M });
+  else el.textContent = 'QR code could not load (no internet?)';
+}
+
+// =====================================================================
+// 1. SETUP: create a queue
+// =====================================================================
+function setupView() {
+  const saved = store.get('tq-counter', null);
+  app.innerHTML = `
+    <h1>Token Queue</h1>
+    <p class="muted">Give people a token number. They scan a QR code and their phone alerts them when their turn is near.</p>
+    ${saved ? `<div class="card"><h2>Your queue</h2>
+      <p><b>${esc(saved.name)}</b></p>
+      <button class="primary big" id="resume">Open counter</button></div>` : ''}
+    <div class="card">
+      <h2>${saved ? 'Start a different queue' : 'Create your queue'}</h2>
+      <label for="name">Business / counter name</label>
+      <input id="name" placeholder="e.g. Sri Clinic – Dr. Rao" maxlength="60">
+      <div style="height:12px"></div>
+      <label for="alert">Alert people when they are this many tokens away</label>
+      <input id="alert" type="number" min="1" max="20" value="3">
+      <div style="height:14px"></div>
+      <button class="primary big" id="create">Create queue</button>
+    </div>`;
+  if (saved) document.getElementById('resume').onclick = () => location.search = '?counter=' + saved.topic;
+  document.getElementById('create').onclick = () => {
+    const name = document.getElementById('name').value.trim() || 'Token Queue';
+    const alertAt = Math.max(1, Math.min(20, +document.getElementById('alert').value || 3));
+    const rnd = crypto.getRandomValues(new Uint8Array(12));
+    const topic = 'tq-' + Array.from(rnd, b => (b % 36).toString(36)).join('');
+    store.set('tq-counter', { topic, name });
+    store.set('tq-state-' + topic, { name, now: 0, issued: 0, alertAt, updated: Date.now() });
+    location.search = '?counter=' + topic;
+  };
+}
+
+// =====================================================================
+// 2. COUNTER: the business's screen
+// =====================================================================
+async function counterView(topic) {
+  let s = store.get('tq-state-' + topic, null);
+  const remote = await fetchLatest(topic);
+  if (remote && (!s || remote.updated > s.updated)) s = remote;
+  if (!s) s = { name: 'Token Queue', now: 0, issued: 0, alertAt: 3, updated: Date.now() };
+  store.set('tq-counter', { topic, name: s.name });
+
+  const joinUrl = baseUrl + '?q=' + topic;
+  app.innerHTML = `
+    <h1>${esc(s.name)}</h1>
+    <p class="muted"><span class="dot" id="dot"></span><span id="conn">Connecting…</span></p>
+    <div class="card">
+      <div class="label">Now serving</div>
+      <div class="num" id="now"></div>
+      <div class="row">
+        <button id="back">− Back</button>
+        <button class="primary" id="next" style="flex:2">Call next ›</button>
+      </div>
+      <div class="stats">
+        <div class="stat"><b id="issued"></b><span class="muted">tokens given</span></div>
+        <div class="stat"><b id="waiting"></b><span class="muted">waiting</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Give a new token</h2>
+      <button class="primary big" id="issue">Give token #<span id="nextTok"></span></button>
+      <div id="ticket" class="hidden" style="text-align:center;margin-top:14px">
+        <div class="label">Token</div>
+        <div class="num" id="tNum" style="font-size:4rem"></div>
+        <p class="muted">Ask them to scan this with their phone camera</p>
+        <div class="qr" id="tQr"></div>
+        <button id="share" style="width:100%">Share link (WhatsApp, SMS…)</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Counter QR (print & stick at the desk)</h2>
+      <p class="muted">For people who already have a paper token: they scan this and type their number.</p>
+      <div class="qr" id="joinQr"></div>
+      <p class="link">${esc(joinUrl)}</p>
+      <div class="row">
+        <button id="print">Print</button>
+        <button id="display">Open TV display</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Settings</h2>
+      <label for="alertAt">Alert when this many tokens away</label>
+      <div class="row"><input id="alertAt" type="number" min="1" max="20"><button id="saveAlert" style="flex:0 0 auto">Save</button></div>
+      <div style="height:12px"></div>
+      <button id="reset" style="width:100%;color:var(--bad)">Start new day (reset to 0)</button>
+      <p class="muted" style="margin-top:12px">Keep this page bookmarked. Anyone with the counter link can control the queue, so don't share it.</p>
+    </div>`;
+  qr(document.getElementById('joinQr'), joinUrl, 180);
+  const $ = id => document.getElementById(id);
+
+  function render() {
+    $('now').textContent = s.now;
+    $('issued').textContent = s.issued;
+    $('waiting').textContent = Math.max(0, s.issued - s.now);
+    $('nextTok').textContent = s.issued + 1;
+    $('next').disabled = s.now >= s.issued;
+    $('back').disabled = s.now <= 0;
+    $('alertAt').value = s.alertAt;
+  }
+  let sending = Promise.resolve();
+  function save() {
+    s.updated = Date.now();
+    store.set('tq-state-' + topic, s);
+    render();
+    const snap = { ...s };
+    sending = sending.then(() => publish(topic, snap)).then(
+      () => setConn(true),
+      () => setConn(false, 'Not sent — check internet'));
+  }
+  function setConn(ok, msg) {
+    $('dot').className = 'dot' + (ok ? ' on' : '');
+    $('conn').textContent = msg || (ok ? 'Live — phones update instantly' : 'Offline — reconnecting…');
+  }
+
+  $('next').onclick = () => { if (s.now < s.issued) { s.now++; save(); } };
+  $('back').onclick = () => { if (s.now > 0) { s.now--; save(); } };
+  $('issue').onclick = () => {
+    s.issued++; save();
+    const url = baseUrl + '?q=' + topic + '&t=' + s.issued;
+    $('ticket').classList.remove('hidden');
+    $('tNum').textContent = s.issued;
+    qr($('tQr'), url, 220);
+    $('share').onclick = () => {
+      const text = `${s.name}: your token is #${s.issued}. Open this link to get an alert when your turn is near: ${url}`;
+      if (navigator.share) navigator.share({ text }).catch(() => {});
+      else location.href = 'https://wa.me/?text=' + encodeURIComponent(text);
+    };
+  };
+  $('saveAlert').onclick = () => { s.alertAt = Math.max(1, Math.min(20, +$('alertAt').value || 3)); save(); };
+  $('reset').onclick = () => {
+    if (confirm('Reset the queue to 0 for a new day?')) { s.now = 0; s.issued = 0; save(); $('ticket').classList.add('hidden'); }
+  };
+  $('print').onclick = () => window.print();
+  $('display').onclick = () => window.open(baseUrl + '?display=' + topic, '_blank');
+
+  render();
+  subscribe(topic, () => {}, ok => setConn(ok));
+  // Publish once on open so phones get the current number.
+  save();
+}
+
+// =====================================================================
+// 3. CUSTOMER: the person waiting
+// =====================================================================
+function customerView(topic, tok) {
+  const key = 'tq-my-' + topic;
+  if (!tok) tok = store.get(key, null);
+  if (!tok) {
+    app.innerHTML = `
+      <h1 id="qname">Token Queue</h1>
+      <div class="card">
+        <label for="t">Your token number</label>
+        <input id="t" type="number" inputmode="numeric" min="1" placeholder="e.g. 18">
+        <div style="height:12px"></div>
+        <button class="primary big" id="go">Continue</button>
+      </div>`;
+    fetchLatest(topic).then(s => { if (s) document.getElementById('qname').textContent = s.name; });
+    document.getElementById('go').onclick = () => {
+      const v = parseInt(document.getElementById('t').value, 10);
+      if (v > 0) { store.set(key, v); location.search = '?q=' + topic + '&t=' + v; }
+    };
+    return;
+  }
+  tok = parseInt(tok, 10);
+  store.set(key, tok);
+
+  app.innerHTML = `
+    <h1 id="qname">Token Queue</h1>
+    <p class="muted"><span class="dot" id="dot"></span><span id="conn">Connecting…</span></p>
+    <div class="card">
+      <div class="label">Your token</div>
+      <div class="num" id="mine">${tok}</div>
+      <div class="stats">
+        <div class="stat"><b id="now">–</b><span class="muted">now serving</span></div>
+        <div class="stat"><b id="ahead">–</b><span class="muted">ahead of you</span></div>
+      </div>
+      <p class="status" id="status">Loading…</p>
+    </div>
+    <div class="card" id="alertCard">
+      <h2>Get an alert on this phone</h2>
+      <p class="muted" id="alertInfo">Tap below and allow notifications. Your phone will buzz when your turn is near.</p>
+      <button class="primary big" id="enable">Turn on alerts</button>
+    </div>
+    <div class="card">
+      <p class="muted"><b>Tip:</b> keep this page open (you can lock the screen). If you close the browser, alerts may stop — just open the link again.</p>
+      <button id="change" style="width:100%">Change token number</button>
+    </div>`;
+  const $ = id => document.getElementById(id);
+  const notified = store.get('tq-notified-' + topic + '-' + tok, {});
+
+  function setAlertUi() {
+    const perm = 'Notification' in window ? Notification.permission : 'unsupported';
+    if (perm === 'granted') {
+      $('alertInfo').textContent = 'Alerts are on ✓ Your phone will buzz when you are close and when it is your turn.';
+      $('enable').textContent = 'Test alert';
+      $('enable').onclick = () => notify('Test alert', 'Alerts are working 👍');
+    } else if (perm === 'denied') {
+      $('alertInfo').textContent = 'Notifications are blocked for this site. Allow them in your browser settings, or keep this page open — it will still beep and vibrate.';
+      $('enable').textContent = 'Keep screen awake instead';
+      $('enable').onclick = () => { keepAwake(); beep(); };
+    } else if (perm === 'unsupported') {
+      $('alertInfo').textContent = 'This browser can’t show notifications (on iPhone: Share → Add to Home Screen, then open it from there). Keep this page open — it will beep and vibrate.';
+      $('enable').textContent = 'Keep screen awake';
+      $('enable').onclick = () => { keepAwake(); beep(); };
+    } else {
+      $('enable').onclick = async () => {
+        beep(); // unlocks sound on phones
+        try { await Notification.requestPermission(); } catch {}
+        setAlertUi();
+      };
+    }
+  }
+  setAlertUi();
+
+  $('change').onclick = () => { try { localStorage.removeItem(key); } catch {} location.search = '?q=' + topic; };
+
+  subscribe(topic, s => {
+    $('qname').textContent = s.name;
+    document.title = s.name;
+    $('now').textContent = s.now;
+    const ahead = tok - s.now;
+    const st = $('status');
+    $('mine').classList.toggle('turn', ahead === 0);
+    if (tok > s.issued && s.issued > 0 && s.now === 0 && tok > s.issued + 50) {
+      st.className = 'status bad'; st.textContent = 'This token number looks wrong.';
+      $('ahead').textContent = '–'; return;
+    }
+    if (ahead > 0) {
+      $('ahead').textContent = ahead - 1;
+      if (ahead <= s.alertAt) {
+        st.className = 'status warn'; st.textContent = `Almost your turn — please come to the counter`;
+        if (!notified.near) { notified.near = true; notify(`${s.name}: almost your turn`, `Token #${tok} — only ${ahead - 1} ahead of you. Please come to the counter.`); }
+      } else {
+        st.className = 'status'; st.textContent = `Please wait — we'll alert you`;
+      }
+      document.title = `#${s.now} serving · you #${tok}`;
+    } else if (ahead === 0) {
+      $('ahead').textContent = 0;
+      st.className = 'status good'; st.textContent = `🎉 It's your turn! Go to the counter now`;
+      if (!notified.turn) { notified.turn = true; notify(`${s.name}: it's your turn!`, `Token #${tok} — please go to the counter now.`); }
+      document.title = `🔔 YOUR TURN #${tok}`;
+    } else {
+      $('ahead').textContent = 0;
+      st.className = 'status bad'; st.textContent = `Your number has been called. Please check with the counter.`;
+    }
+    store.set('tq-notified-' + topic + '-' + tok, notified);
+  }, ok => {
+    $('dot').className = 'dot' + (ok ? ' on' : '');
+    $('conn').textContent = ok ? 'Live' : 'Reconnecting…';
+  });
+}
+
+// =====================================================================
+// 4. TV DISPLAY
+// =====================================================================
+function displayView(topic) {
+  document.body.classList.add('display');
+  app.innerHTML = `
+    <h1 id="qname" style="font-size:3vw">Token Queue</h1>
+    <div class="label" style="font-size:2vw">Now serving</div>
+    <div class="num" id="now">–</div>
+    <p class="muted" style="font-size:1.6vw">Scan the QR at the counter to get a phone alert</p>`;
+  let last = null;
+  subscribe(topic, s => {
+    document.getElementById('qname').textContent = s.name;
+    document.getElementById('now').textContent = s.now;
+    if (last !== null && s.now !== last) beep();
+    last = s.now;
+  }, () => {});
+}
+
+// ---- Router ----
+if (params.get('counter')) counterView(params.get('counter'));
+else if (params.get('display')) displayView(params.get('display'));
+else if (params.get('q')) customerView(params.get('q'), params.get('t'));
+else setupView();
+</script>
+</body>
+</html>
